@@ -916,6 +916,17 @@ void derive(FILE *out) {
         fputs(":", out);
         emit_value(out, state[s].value);
     }
+    /* Spec §5.6: setter for every key in state, not only contested ones. The
+     * streaming loop above already tracked state[i].setter and discarded it,
+     * which left a same-class nudge parented on the wrong record landing or
+     * vanishing depending only on whether its own id sorted first. */
+    fputs("},\"setters\":{", out);
+    for (size_t s2 = 0; s2 < state_count; s2++) {
+        if (s2 > 0) fputc(',', out);
+        emit_string(out, state[s2].key);
+        fputs(":", out);
+        emit_string(out, state[s2].setter ? state[s2].setter : "");
+    }
     fputs("},\"order\":[", out);
     for (size_t i = 0; i < order_count; i++) {
         if (i > 0) fputc(',', out);
