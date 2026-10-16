@@ -597,6 +597,359 @@ static void record_leaf(record_t *r, char out_hex[65]) {
 
 // ========== Main ==========
 
+
+/* ==========================================================================
+ * derive() -- spec §5
+ *
+ * Added after gitpp-fold-conformance demonstrated that the leaf fuzz cannot
+ * see fold semantics. This is the streaming model of §5.2, which is what
+ * every other port uses.
+ *
+ *   for each record in topo order:
+ *     for each key K it sets:
+ *       K unset        -> this record becomes the setter
+ *       higher class   -> wins; the previous setter becomes a loser
+ *       equal class    -> descendant wins, else the incumbent wins
+ *       lower class    -> this record is a loser
+ *
+ * Two spec details that are easy to get backwards. A conformance corpus
+ * exists because both were shipped broken at least once:
+ *
+ *   1. DIRECTION (§5.2). Within the winning class a candidate is dominated
+ *      if IT is an ancestor of another candidate; survivors are the
+ *      most-derived. gitpp-doctor v0.2.1 asked the inverse and folded every
+ *      chain to its OLDEST record.
+ *   2. DISTINCTNESS (§5.3). A conflict requires 2+ DISTINCT values. Two
+ *      records that agree must not produce one -- gitpp-cs v0.3.1 and
+ *      gitpp-pl v0.1.4 both recorded a loser on every outranking and never
+ *      compared the values.
+ * ========================================================================== */
+
+#define CLASS_OVERRIDE 3
+#define CLASS_TASK     2
+#define CLASS_WITNESS  1
+
+static int class_rank(const char *kind) {
+    if (!kind) return 0;
+    if (strcmp(kind, "override") == 0) return CLASS_OVERRIDE;
+    if (strcmp(kind, "task") == 0) return CLASS_TASK;
+    if (strcmp(kind, "witness") == 0) return CLASS_WITNESS;
+    return 0;
+}
+
+static int record_index(const char *id) {
+    if (!id) return -1;
+    for (size_t i = 0; i < record_count; i++)
+        if (records[i].id && strcmp(records[i].id, id) == 0) return (int)i;
+    return -1;
+}
+
+/* Is `desc` a transitive descendant of `anc` within the applied set? */
+static int is_descendant(const unsigned char *applied, const char *anc, const char *desc) {
+    int ai, di;
+    if (!anc || !desc || strcmp(anc, desc) == 0) return 0;
+    ai = record_index(anc);
+    di = record_index(desc);
+    if (ai < 0 || di < 0) return 0;
+    unsigned char seen[MAX_RECORDS];
+    int stack[MAX_RECORDS], sp = 0;
+    memset(seen, 0, sizeof(seen));
+    stack[sp++] = di;
+    while (sp > 0) {
+        int cur = stack[--sp];
+        if (seen[cur]) continue;
+        seen[cur] = 1;
+        for (size_t p = 0; p < records[cur].parent_count; p++) {
+            int pi = record_index(records[cur].parents[p]);
+            if (pi < 0 || !applied[pi]) continue;
+            if (strcmp(records[pi].id, anc) == 0) return 1;
+            stack[sp++] = pi;
+        }
+    }
+    return 0;
+}
+
+/* DFS colouring. Returns 1 when `rid` is already on the current path. */
+static int cycle_dfs(int rid, unsigned char *color, unsigned char *in_cycle) {
+    if (color[rid] == 1) return 1;
+    if (color[rid] == 2) return 0;
+    color[rid] = 1;
+    for (size_t p = 0; p < records[rid].parent_count; p++) {
+        int pi = record_index(records[rid].parents[p]);
+        if (pi < 0) continue;
+        if (cycle_dfs(pi, color, in_cycle)) {
+            in_cycle[rid] = 1;
+            in_cycle[pi] = 1;
+            return 1;
+        }
+    }
+    color[rid] = 2;
+    return 0;
+}
+
+/* Structural equality via canonical re-serialization, so key order in a
+ * nested object is never mistaken for a value difference (§5.3). */
+static int values_equal(json_value_t *a, json_value_t *b) {
+    if (!a || !b) return a == b;
+    if (a->type != b->type) return 0;
+    char ba[4096], bb[4096];
+    FILE *fa = fmemopen(ba, sizeof(ba), "w");
+    FILE *fb = fmemopen(bb, sizeof(bb), "w");
+    if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); return a == b; }
+    emit_value(fa, a);
+    emit_value(fb, b);
+    fclose(fa); fclose(fb);
+    return strcmp(ba, bb) == 0;
+}
+
+typedef struct {
+    char *key;
+    char *winner;
+    char **losers;
+    size_t loser_count;
+    size_t loser_cap;
+} conflict_t;
+
+static void conflict_add_loser(conflict_t *cf, const char *id) {
+    for (size_t i = 0; i < cf->loser_count; i++)
+        if (strcmp(cf->losers[i], id) == 0) return;
+    if (cf->loser_count == cf->loser_cap) {
+        cf->loser_cap = cf->loser_cap ? cf->loser_cap * 2 : 4;
+        cf->losers = realloc(cf->losers, sizeof(char*) * cf->loser_cap);
+    }
+    cf->losers[cf->loser_count++] = (char *)id;
+}
+
+typedef struct {
+    char *key;
+    json_value_t *value;
+    char *setter;
+    int setter_class;
+} state_entry_t;
+
+static conflict_t *g_conflicts = NULL;
+static size_t g_conflict_count = 0, g_conflict_cap = 0;
+
+static conflict_t *conflict_for(const char *key) {
+    for (size_t i = 0; i < g_conflict_count; i++)
+        if (strcmp(g_conflicts[i].key, key) == 0) return &g_conflicts[i];
+    if (g_conflict_count == g_conflict_cap) {
+        g_conflict_cap = g_conflict_cap ? g_conflict_cap * 2 : 8;
+        g_conflicts = realloc(g_conflicts, sizeof(conflict_t) * g_conflict_cap);
+    }
+    memset(&g_conflicts[g_conflict_count], 0, sizeof(conflict_t));
+    g_conflicts[g_conflict_count].key = (char *)key;
+    return &g_conflicts[g_conflict_count++];
+}
+
+void derive(FILE *out) {
+    size_t n = record_count;
+    unsigned char applied[MAX_RECORDS], color[MAX_RECORDS], in_cycle[MAX_RECORDS];
+    memset(color, 0, sizeof(color));
+    memset(in_cycle, 0, sizeof(in_cycle));
+
+    /* --- orphans: missing parent (spec §5.5) --- */
+    for (size_t i = 0; i < n; i++) {
+        applied[i] = 1;
+        for (size_t p = 0; p < records[i].parent_count; p++)
+            if (record_index(records[i].parents[p]) < 0) { applied[i] = 0; break; }
+    }
+    /* --- cycles: excluded AND reported (spec §5.4/§5.5) --- */
+    for (size_t i = 0; i < n; i++)
+        if (color[i] == 0) cycle_dfs((int)i, color, in_cycle);
+    for (size_t i = 0; i < n; i++) if (in_cycle[i]) applied[i] = 0;
+
+    /* eligible[] is stable: "not an orphan, not in a cycle". Kahn mutates a
+     * separate copy, because ancestry checks in §5.2 need the ORIGINAL
+     * membership to stay intact for the whole resolution. */
+    unsigned char eligible[MAX_RECORDS];
+    for (size_t i = 0; i < n; i++) eligible[i] = applied[i];
+
+    /* --- Kahn order, smallest id first (spec §5.4) --- */
+    int in_deg[MAX_RECORDS];
+    int order[MAX_RECORDS];
+    size_t order_count = 0;
+    for (size_t i = 0; i < n; i++) in_deg[i] = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!eligible[i]) continue;
+        for (size_t p = 0; p < records[i].parent_count; p++) {
+            int pi = record_index(records[i].parents[p]);
+            if (pi >= 0 && applied[pi]) in_deg[i]++;
+        }
+    }
+    unsigned char emitted[MAX_RECORDS];
+    memset(emitted, 0, sizeof(emitted));
+    while (1) {
+        int pick = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (!eligible[i] || emitted[i] || in_deg[i] != 0) continue;
+            if (pick < 0 || code_point_cmp(records[i].id, records[pick].id) < 0) pick = (int)i;
+        }
+        if (pick < 0) break;
+        order[order_count++] = pick;
+        emitted[pick] = 1;
+        for (size_t j = 0; j < n; j++) {
+            if (j == (size_t)pick || !eligible[j] || emitted[j]) continue;
+            for (size_t p = 0; p < records[j].parent_count; p++)
+                if (record_index(records[j].parents[p]) == pick) { in_deg[j]--; break; }
+        }
+    }
+
+    /* --- streaming resolution (spec §5.2) --- */
+    state_entry_t *state = NULL;
+    size_t state_count = 0, state_cap = 0;
+    g_conflicts = NULL; g_conflict_count = 0; g_conflict_cap = 0;
+
+    for (size_t oi = 0; oi < order_count; oi++) {
+        record_t *r = &records[order[oi]];
+        if (!r->effects || r->effects->type != JSON_OBJECT) continue;
+        int my_class = class_rank(r->kind);
+        for (size_t m = 0; m < r->effects->u.object.count; m++) {
+            json_member_t *mem = r->effects->u.object.members[m];
+            const char *key = mem->key;
+            json_value_t *val = mem->value;
+
+            state_entry_t *slot = NULL;
+            for (size_t s = 0; s < state_count; s++)
+                if (strcmp(state[s].key, key) == 0) { slot = &state[s]; break; }
+
+            if (!slot) {
+                if (state_count == state_cap) {
+                    state_cap = state_cap ? state_cap * 2 : 8;
+                    state = realloc(state, sizeof(state_entry_t) * state_cap);
+                }
+                state[state_count].key = (char *)key;
+                state[state_count].value = val;
+                state[state_count].setter = r->id;
+                state[state_count].setter_class = my_class;
+                state_count++;
+                continue;
+            }
+
+            int incumbent_class = slot->setter_class;
+            if (my_class > incumbent_class) {
+                conflict_t *cf = conflict_for(key);
+                /* Record the displaced incumbent unconditionally. On the FIRST
+                 * takeover cf->winner is still NULL, so a guarded add would
+                 * silently drop it. The §5.3 pass below removes any loser whose
+                 * value matches the winner's, so eager recording is safe. */
+                conflict_add_loser(cf, slot->setter);
+                cf->winner = r->id;
+                slot->value = val; slot->setter = r->id; slot->setter_class = my_class;
+            } else if (my_class == incumbent_class) {
+                if (is_descendant(eligible, slot->setter, r->id)) {
+                    conflict_t *cf = conflict_for(key);
+                    conflict_add_loser(cf, slot->setter);
+                    cf->winner = r->id;
+                    slot->value = val; slot->setter = r->id;
+                } else {
+                    /* Incumbent holds. The conflict entry may be brand new, in
+                     * which case its winner is still unset -- the incumbent IS
+                     * the winner, so record it. Without this the entry looks
+                     * like a conflict with no winner and gets discarded below. */
+                    conflict_t *cf = conflict_for(key);
+                    if (!cf->winner) cf->winner = slot->setter;
+                    conflict_add_loser(cf, r->id);
+                }
+            } else {
+                /* Lower class: the incumbent holds. Same winner fix. */
+                conflict_t *cf = conflict_for(key);
+                if (!cf->winner) cf->winner = slot->setter;
+                conflict_add_loser(cf, r->id);
+            }
+        }
+    }
+
+    /* --- §5.3: drop conflicts with no genuine disagreement, and keep only
+     *     losers whose value actually differs from the winner's. --- */
+    size_t kept = 0;
+    for (size_t c = 0; c < g_conflict_count; c++) {
+        conflict_t *cf = &g_conflicts[c];
+        int distinct = 0, have_winner = 0;
+        json_value_t *wv = NULL;
+        for (size_t i = 0; i < n; i++) {
+            if (!records[i].effects || records[i].effects->type != JSON_OBJECT) continue;
+            for (size_t m = 0; m < records[i].effects->u.object.count; m++) {
+                json_member_t *mem = records[i].effects->u.object.members[m];
+                if (strcmp(mem->key, cf->key) != 0) continue;
+                if (cf->winner && strcmp(records[i].id, cf->winner) == 0) { wv = mem->value; have_winner = 1; }
+            }
+        }
+        /* "2+ distinct values exist" is equivalent to "some candidate's value
+         * differs from the winner's", given wv IS the winner's value. */
+        if (have_winner) {
+            for (size_t i = 0; i < n; i++) {
+                if (!eligible[i]) continue;
+                if (!records[i].effects || records[i].effects->type != JSON_OBJECT) continue;
+                for (size_t m = 0; m < records[i].effects->u.object.count; m++) {
+                    json_member_t *mem = records[i].effects->u.object.members[m];
+                    if (strcmp(mem->key, cf->key) != 0) continue;
+                    if (!values_equal(mem->value, wv)) distinct = 1;
+                }
+            }
+        }
+        if (!have_winner || !distinct) { free(cf->losers); continue; }
+        size_t w = 0;
+        for (size_t l = 0; l < cf->loser_count; l++) {
+            int li = record_index(cf->losers[l]);
+            if (li < 0 || !eligible[li]) continue;
+            int differs = 0;
+            if (records[li].effects && records[li].effects->type == JSON_OBJECT) {
+                for (size_t m = 0; m < records[li].effects->u.object.count; m++) {
+                    json_member_t *mem = records[li].effects->u.object.members[m];
+                    if (strcmp(mem->key, cf->key) == 0 && !values_equal(mem->value, wv)) differs = 1;
+                }
+            }
+            if (differs) cf->losers[w++] = cf->losers[l];
+        }
+        cf->loser_count = w;
+        if (w == 0) { free(cf->losers); continue; }
+        g_conflicts[kept++] = *cf;
+    }
+    g_conflict_count = kept;
+
+    /* --- emit --- */
+    fprintf(out, "{\"state\":{");
+    for (size_t s = 0; s < state_count; s++) {
+        if (s > 0) fputs(",", out);
+        emit_string(out, state[s].key);
+        fputs(":", out);
+        emit_value(out, state[s].value);
+    }
+    fputs("},\"order\":[", out);
+    for (size_t i = 0; i < order_count; i++) {
+        if (i > 0) fputc(',', out);
+        emit_string(out, records[order[i]].id);
+    }
+    fputs("],\"conflicts\":[", out);
+    for (size_t c = 0; c < g_conflict_count; c++) {
+        if (c > 0) fputc(',', out);
+        fputs("{\"key\":", out);
+        emit_string(out, g_conflicts[c].key);
+        fputs(",\"winner\":", out);
+        emit_string(out, g_conflicts[c].winner ? g_conflicts[c].winner : "");
+        fputs(",\"losers\":[", out);
+        for (size_t l = 0; l < g_conflicts[c].loser_count; l++) {
+            if (l > 0) fputc(',', out);
+            emit_string(out, g_conflicts[c].losers[l]);
+        }
+        fputs("]}", out);
+    }
+    fputs("],\"orphans\":[", out);
+    int first_orphan = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (eligible[i]) continue;
+        if (!first_orphan) fputc(',', out);
+        first_orphan = 0;
+        emit_string(out, records[i].id);
+    }
+    fputs("]}\n", out);
+
+    for (size_t c = 0; c < g_conflict_count; c++) free(g_conflicts[c].losers);
+    free(g_conflicts); g_conflicts = NULL; g_conflict_count = g_conflict_cap = 0;
+    free(state);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s <file.json> [--at <id>]\n", argv[0]);
@@ -604,8 +957,10 @@ int main(int argc, char **argv) {
     }
     const char *file = argv[1];
     const char *at = NULL;
+    int do_derive = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--at") == 0 && i + 1 < argc) at = argv[++i];
+        if (strcmp(argv[i], "--derive") == 0) do_derive = 1;
     }
     FILE *f = fopen(file, "r");
     if (!f) { perror("fopen"); return 1; }
@@ -629,7 +984,9 @@ int main(int argc, char **argv) {
             records[record_count++] = parse_record(r);
         }
     }
-    if (at) {
+    if (do_derive) {
+        derive(stdout);
+    } else if (at) {
         char hex[65];
         char closure_ids[MAX_RECORDS][256];
         memset(closure_ids, 0, sizeof(closure_ids));
