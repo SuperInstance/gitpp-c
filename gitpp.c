@@ -285,20 +285,40 @@ static json_value_t *json_parse(const char **p) {
 // ========== JSON canonical encoder (per spec) ==========
 
 // Number formatting per spec §3
+// Try 15/16/17 sig digits (Python repr short algorithm). Integer form
+// requires |v| < 1e16 to fit in int64 across all 5 ports.
+// Special case: if |v| >= 1e16 and the only round-trip is integer form,
+// skip it and use scientific (Python's repr() does the same).
 static void emit_number(FILE *out, double v) {
     if (v == 0) { fprintf(out, "0"); return; }
-    // Integer check
-    if (v == floor(v) && fabs(v) < 1e21) {
-        // Integer: emit as long
+    if (v == floor(v) && fabs(v) < 1e16) {
         fprintf(out, "%lld", (long long)v);
         return;
     }
     double abs_v = fabs(v);
-    if (abs_v < 1e-4 || abs_v >= 1e17) {
-        // Scientific notation
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%.15e", v);
-        // Find 'e' and split
+    char buf[64];
+    int digits;
+    int found = 0;
+    for (digits = 15; digits <= 17; digits++) {
+        snprintf(buf, sizeof(buf), "%.*g", digits, v);
+        double back = strtod(buf, NULL);
+        if (back == v) {
+            if (abs_v >= 1e16 && strchr(buf, 'e') == NULL) continue;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        snprintf(buf, sizeof(buf), "%.16e", v);
+        char *ep = strchr(buf, 'e');
+        if (ep) {
+            char *p = ep - 1;
+            while (p > buf && *p == '0') p--;
+            if (*p == '.') p--;
+            memmove(p + 1, ep, strlen(ep) + 1);
+        }
+    }
+    if (abs_v < 1e-4 || abs_v >= 1e16) {
         char *e = strchr(buf, 'e');
         if (e) {
             *e = '\0';
@@ -310,9 +330,6 @@ static void emit_number(FILE *out, double v) {
         }
         return;
     }
-    // Regular decimal
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%.15g", v);
     fprintf(out, "%s", buf);
 }
 
