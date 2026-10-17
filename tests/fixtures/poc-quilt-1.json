@@ -1,0 +1,85 @@
+[
+ {
+  "effects": {
+   "project": "poc-quilt-1",
+   "status": "open"
+  },
+  "id": "genesis",
+  "kind": "task",
+  "parents": []
+ },
+ {
+  "effects": {
+   "config.timeout": 30,
+   "feature.cache": "on"
+  },
+  "id": "task-a",
+  "kind": "task",
+  "parents": [
+   "genesis"
+  ]
+ },
+ {
+  "effects": {
+   "config.timeout": 60,
+   "feature.search": "on"
+  },
+  "id": "task-b",
+  "kind": "task",
+  "parents": [
+   "genesis"
+  ]
+ },
+ {
+  "effects": {
+   "config.timeout": 45
+  },
+  "id": "override-1",
+  "kind": "override",
+  "parents": [
+   "task-a",
+   "task-b"
+  ],
+  "reason": "captain: 45 is the safe value"
+ },
+ {
+  "effects": {
+   "feature.inherited": true
+  },
+  "id": "task-c",
+  "kind": "task",
+  "parents": [
+   "override-1"
+  ]
+ },
+ {
+  "effects": {
+   "config.timeout": 99
+  },
+  "id": "task-d",
+  "kind": "task",
+  "parents": [
+   "task-b"
+  ]
+ },
+ {
+  "effects": {
+   "env.oracle_disk_pct": 93
+  },
+  "id": "witness-1",
+  "kind": "witness",
+  "parents": [
+   "genesis"
+  ]
+ },
+ {
+  "effects": {
+   "env.oracle_load1_x100": 17
+  },
+  "id": "witness-2",
+  "kind": "witness",
+  "parents": [
+   "override-1"
+  ]
+ }
+]
