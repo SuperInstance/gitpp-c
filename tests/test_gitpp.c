@@ -541,6 +541,76 @@ static char *two_key_docs(size_t pad, char win, char lose) {
     return doc;
 }
 
+
+/* SPEC §4 -- an incomplete closure has a NULL root.
+ *
+ * "If any ancestor of `at` is missing from the set, the closure is
+ * incomplete and the root is `null`."
+ *
+ * The port used to walk the ancestor graph and SKIP any parent id that
+ * was not in the record set. The missing parent was dropped silently,
+ * the closure looked complete, and a root was computed over whatever
+ * survived. Every other port returns null for this case; this one
+ * returned a hash -- so the five ports DISAGREED and the disagreement
+ * was invisible to the cross-port harness, whose accounting filed a
+ * case as an "error" whenever any sibling port failed.
+ *
+ * The two cases below are the corpus case L2/incomplete-closure and its
+ * transitive variant: a parent missing TWO HOPS up also makes the
+ * closure incomplete.
+ */
+static void test_incomplete_closure_null_root(void) {
+    section("SPEC §4 -- an incomplete closure has a NULL root");
+
+    /* Direct: at's own parent is missing. */
+    const char *inc =
+        "[{\"id\":\"task-1\",\"kind\":\"task\",\"parents\":[\"missing-parent\"],\"effects\":{\"x\":1}},"
+        "{\"id\":\"task-2\",\"kind\":\"task\",\"parents\":[\"task-1\"],\"effects\":{\"y\":2}}]";
+    json_value_t *doc = load(inc);
+    ok(doc != NULL, "the incomplete-closure document parses");
+    if (doc) {
+        char hex[65];
+        char ids[MAX_RECORDS][256];
+        memset(ids, 0, sizeof(ids));
+        size_t count = 0;
+        closure_root("task-2", hex, ids, &count);
+        eq_str(hex, "", "a missing ancestor leaves NO root (the caller prints null)");
+        ok(count == 0, "an incomplete closure contains no records in the root");
+    }
+
+    /* Transitive: the missing ancestor is TWO hops up. */
+    const char *inc2 =
+        "[{\"id\":\"a\",\"kind\":\"task\",\"parents\":[\"ghost\"],\"effects\":{\"x\":1}},"
+        "{\"id\":\"b\",\"kind\":\"task\",\"parents\":[\"a\"],\"effects\":{\"y\":2}},"
+        "{\"id\":\"c\",\"kind\":\"task\",\"parents\":[\"b\"],\"effects\":{\"z\":3}}]";
+    json_value_t *doc2 = load(inc2);
+    ok(doc2 != NULL, "the transitive incomplete-closure document parses");
+    if (doc2) {
+        char hex2[65];
+        char ids2[MAX_RECORDS][256];
+        memset(ids2, 0, sizeof(ids2));
+        size_t count2 = 0;
+        closure_root("c", hex2, ids2, &count2);
+        eq_str(hex2, "", "a missing ancestor TWO HOPS UP also leaves no root");
+    }
+
+    /* The control: a COMPLETE closure still gets a real root. */
+    const char *good =
+        "[{\"id\":\"a\",\"kind\":\"task\",\"parents\":[],\"effects\":{\"x\":1}},"
+        "{\"id\":\"b\",\"kind\":\"task\",\"parents\":[\"a\"],\"effects\":{\"y\":2}}]";
+    json_value_t *doc3 = load(good);
+    ok(doc3 != NULL, "the complete-closure document parses");
+    if (doc3) {
+        char hex3[65];
+        char ids3[MAX_RECORDS][256];
+        memset(ids3, 0, sizeof(ids3));
+        size_t count3 = 0;
+        closure_root("b", hex3, ids3, &count3);
+        ok(strlen(hex3) == 64, "a COMPLETE closure still gets a 64-char root");
+        ok(count3 == 2, "a complete closure contains both records");
+    }
+}
+
 static void test_canon_buffer_overflow(void) {
     section("DEFECT 3 -- a canonical form larger than the emit buffer");
     char h[65];
@@ -607,6 +677,7 @@ int main(void) {
     test_losers_order();
     test_orphans();
     test_canon_buffer_overflow();
+    test_incomplete_closure_null_root();
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }
