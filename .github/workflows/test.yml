@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Both compilers matter. gcc's -std=gnu99 is REQUIRED here: fmemopen
+        # is a GNU extension, and under -std=c99 the FILE* built from it is
+        # garbage, so the binary exits 0 having emitted NOTHING. That is a
+        # silent failure, and a build that "passes" while producing no
+        # output is exactly the class of defect this fleet keeps finding.
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build and test
+        run: |
+          make clean 2>/dev/null || true
+          make test
+          # The suite must actually PRINT something. A test target that
+          # exits 0 while emitting nothing is the same failure as the
+          # comparator that compared against nothing.
+          make test 2>&1 | tee /tmp/out.txt
+          test -s /tmp/out.txt
