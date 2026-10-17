@@ -110,10 +110,27 @@ These are documented in `gitpp.c` comments for future port authors:
    contains an escape. Pin the case that *distinguishes*, not only the ones
    that already agree.
 
-7. **`record_leaf()` hashes into a fixed `char buf[8192]`.** A record whose
-   canonical form exceeds 8 KiB is truncated before hashing, silently. Not
-   fixed here — the pinned cases are small — but it is the same class of silent
-   disagreement as the bugs above, and a large `effects` map will reach it.
+7. **Never build a canonical form in a fixed buffer.** This port shipped that
+   twice: `record_leaf()` hashed out of `char buf[8192]` and `values_equal()`
+   compared two 4096-byte buffers, both via `fmemopen`. Every pinned case was
+   small, so the corpus never reached either bound and the suite stayed green
+   while the port silently produced wrong answers. Two things to know:
+
+   - `fmemopen(buf, sizeof buf, "w")` keeps the **last byte for its own NUL**,
+     so `char buf[8192]` actually holds 8191 bytes, not 8192. The port hashed
+     `sha256(canon[0:8191])` and had no way to notice.
+   - In `values_equal()` truncation was not a wrong hash but a wrong *fold*:
+     two different values sharing a 4095-byte prefix compared EQUAL, so §5.3
+     read "no genuine disagreement" and deleted a real conflict from the
+     ledger.
+
+   The fix is `open_memstream()`, not a bigger array — a fixed bound is the same
+   bug one size down, and "big enough" is unprovable against an adversarial
+   record. It is the same glibc extension as `fmemopen` (so `-std=gnu99` is
+   still mandatory) and it reallocates as the emitter writes. See
+   `canon_begin()`/`canon_end()` in `gitpp.c`. The emitter must never be handed
+   a sink that can run out; when `open_memstream` fails the port exits loudly,
+   because a short canonical form hashes to a plausible-looking wrong leaf.
 
 ## License
 

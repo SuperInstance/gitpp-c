@@ -490,6 +490,114 @@ static void test_orphans(void) {
         check_partition(tricky[t], "tricky set");
 }
 
+/* ---------------- DEFECT 3: canonical form built in a FIXED buffer ----------
+ *
+ * record_leaf() emitted the canon into `char buf[8192]` via fmemopen(), and
+ * values_equal() emitted each side of a §5.3 comparison into `char
+ * ba[4096]`. Both silently hashed/compared a PREFIX. The pinned cases are all
+ * tiny, so the corpus never reached either bound and nothing failed.
+ *
+ * Pre-fix, with pad = 8400 'A':
+ *     C leaf   45c72d357e7192a5caca7fb7ee2d1ec81fa388ff808e37a33379c12e96ea4c59
+ *   = SHA-256(canon[0:8191]) exactly -- fmemopen keeps the last byte for its own
+ *   NUL, so the effective buffer was 8191, not 8192, and the port never knew.
+ *   C closure root d56db1363847ae6315e724df9231448119c856cae8223c551fcce506fc2f5d63
+ *   reference    a25c4aace6ef1a2049f8b8219175c1ca8df4025fa4884d82693c22ab46744a88
+ *                4da33bc49dc7b15324b12d40e6f3b9040ae404ed83d147669b8dd61024bb81b7
+ *
+ * Every expectation below is a cross-port pin: git.pp-doctor (the Python
+ * reference), gitpp-js, gitpp-pl and gitpp-cs all produce the same value, so
+ * these literals are not this port grading its own homework.
+ */
+
+// A one-record document whose canon carries `pad` copies of `fill` in effects.
+static char *doc_with_pad(char fill, size_t pad, char last /* 0 = none */) {
+    const char *head = "[{\"id\":\"big-1\",\"kind\":\"task\",\"parents\":[],\"effects\":{\"pad\":\"";
+    const char *tail = "\"},\"reason\":null}]";
+    size_t need = strlen(head) + pad + 2 * strlen(tail) + 8;
+    char *doc = malloc(need);
+    size_t n = 0;
+    for (const char *q = head; *q; q++) doc[n++] = *q;
+    for (size_t i = 0; i < pad; i++) doc[n++] = fill;
+    if (last) doc[n++] = last;
+    for (const char *q = tail; *q; q++) doc[n++] = *q;
+    doc[n] = '\0';
+    return doc;
+}
+
+// A two-record document: an override and a task both set key "k", to strings
+// that share their first `pad` bytes and differ only in the final character.
+static char *two_key_docs(size_t pad, char win, char lose) {
+    const char *fmt = "[{\"id\":\"override-1\",\"kind\":\"override\",\"parents\":[],"
+                      "\"effects\":{\"k\":\"%s%c\"},\"reason\":\"set\"},"
+                      "{\"id\":\"task-b\",\"kind\":\"task\",\"parents\":[],"
+                      "\"effects\":{\"k\":\"%s%c\"},\"reason\":\"set\"}]";
+    char *a = malloc(pad + 2), *b = malloc(pad + 2);
+    memset(a, 'A', pad); a[pad] = '\0';
+    memset(b, 'A', pad); b[pad] = '\0';
+    char *doc = malloc(2 * pad + 512);
+    sprintf(doc, fmt, a, win, b, lose);
+    free(a); free(b);
+    return doc;
+}
+
+static void test_canon_buffer_overflow(void) {
+    section("DEFECT 3 -- a canonical form larger than the emit buffer");
+    char h[65];
+
+    // 1. The canon is 8486 bytes; the old array held 8191 of them.
+    char *d1 = doc_with_pad('A', 8400, 0);
+    leaf_of(d1, h);
+    eq_str(h, "a25c4aace6ef1a2049f8b8219175c1ca8df4025fa4884d82693c22ab46744a88",
+           "an 8486-byte canonical form hashes in FULL (not its first 8191 bytes)");
+    free(d1);
+
+    // 2. The collision truncation actually caused: two records sharing their
+    //    first 8191 canonical bytes are DIFFERENT records and must not alias.
+    char plain[65], tail[65];
+    char *d2 = doc_with_pad('A', 8400, 0);
+    leaf_of(d2, plain);
+    free(d2);
+    char *d3 = doc_with_pad('A', 8399, 'B');   /* identical but for the last byte */
+    leaf_of(d3, tail);
+    free(d3);
+    ok(strcmp(plain, tail) != 0,
+       "records differing only AFTER the old 8192-byte boundary get different leaves");
+    eq_str(tail, "54901e5eb6d86596ef5e498e4c7db0b6a3a8b68f7fa23603f8e6f1e294e1b0f5",
+           "... and the second one equals the reference leaf");
+
+    // 3. The bound must be UNBOUNDED, not merely larger. 200 KB of canon is 24x
+    //    the old buffer and 24x any "just raise the constant" fix; if this one
+    //    passes, no constant in this file is doing the work.
+    char *d4 = doc_with_pad('Z', 200000, 0);
+    leaf_of(d4, h);
+    eq_str(h, "c5ee0b8ba6308affb908b6d000ffb348dae639f042eec6ba44e54f095f953a20",
+           "a 200086-byte canonical form (24x the old buffer) still matches the reference");
+    free(d4);
+
+    // 4. values_equal()'s 4096 buffers, which were the worse of the two: two
+    //    DIFFERENT values with a 4201-byte shared prefix compared EQUAL, so
+    //    §5.3 read "no genuine disagreement" and DELETED a real conflict from
+    //    the fold -- the ledger lost an entry, not just a hash.
+    char *doc = two_key_docs(4200, 'X', 'Y');
+    char *out = derive_of(doc);
+    ok(out && strstr(out, "\"key\":\"k\"") != NULL,
+       "a conflict whose values differ only after 4095 canonical bytes SURVIVES section 5.3");
+    ok(out && strstr(out, "\"losers\":[\"task-b\"]") != NULL,
+       "... with task-b still listed as the loser");
+    if (out) free(out);
+    free(doc);
+
+    // The control: the same pair with short values. §5.3 has always kept this
+    // one, so a failure above is the 4096 buffer and nothing else.
+    char *ctl = two_key_docs(4, 'X', 'Y');
+    char *cout = derive_of(ctl);
+    ok(cout && strstr(cout, "\"key\":\"k\"") != NULL,
+       "control: the same pair of short values still conflicts");
+    if (cout) free(cout);
+    free(ctl);
+}
+
 int main(void) {
     printf("gitpp-c regression suite\n");
     test_pinned_leaves();
@@ -498,6 +606,7 @@ int main(void) {
     test_parents_set();
     test_losers_order();
     test_orphans();
+    test_canon_buffer_overflow();
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

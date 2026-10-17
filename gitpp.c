@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <math.h>
+#include <errno.h>
 
 // ========== SHA-256 (from RFC 6234) ==========
 
@@ -520,6 +521,77 @@ static void emit_value(FILE *out, json_value_t *v) {
     }
 }
 
+// ========== Canonical-form sink ==========
+//
+// Every canonical string this port hashes or compares used to be built into a
+// fixed stack array -- `char buf[8192]` in record_leaf(), `char ba[4096]` in
+// values_equal(). A record whose canonical form exceeded that array was
+// silently truncated before the bytes ever reached SHA-256, so the leaf was
+// the hash of a PREFIX of the record, with no error and no warning. In
+// values_equal() truncation was worse than a wrong hash: two different values
+// sharing a long prefix compared EQUAL, which deleted a real §5.3 conflict from
+// the fold.
+//
+// The fix is not a bigger array. There is no constant in this file that an
+// adversarial record (a 10 MB string in `effects` is enough) cannot exceed, so
+// any fixed bound -- 8 KiB, 1 MiB, 1 GiB -- is the same bug one size down.
+//
+// open_memstream() is the same glibc extension the port already depends on for
+// fmemopen() (see the Makefile: this is why -std=gnu99, not -std=c99, is
+// mandatory), and it reallocates its backing store as the emitter writes. The
+// canonical form is therefore unbounded BY CONSTRUCTION: it is limited only by
+// memory, and if memory runs out the failure is loud, not silent. There is no
+// size to get wrong, so there is no bound to prove.
+//
+// A caller-owned struct is required: open_memstream() records the ADDRESSES of
+// buf/len, so the canon_t must outlive the stream. canon_end() hands back the
+// malloc'd buffer (NUL-terminated, per POSIX) and leaves the length in c->len.
+
+typedef struct {
+    FILE *fp;
+    char *buf;
+    size_t len;
+} canon_t;
+
+static void canon_begin(canon_t *c) {
+    c->buf = NULL;
+    c->len = 0;
+    c->fp = open_memstream(&c->buf, &c->len);
+    if (!c->fp) {
+        fprintf(stderr, "gitpp: open_memstream failed (%s)\n", strerror(errno));
+        exit(1);
+    }
+}
+
+// Flush and close. Returns the malloc'd canonical bytes; caller frees.
+// Never returns a short buffer: an I/O or allocation failure inside the
+// memstream leaves the stream in an error state, and hashing what did land
+// would be precisely the silent-wrong-answer bug this replaced.
+static char *canon_end(canon_t *c) {
+    if (fflush(c->fp) != 0 || ferror(c->fp)) {
+        fprintf(stderr, "gitpp: canonical form write failed (%s)\n", strerror(errno));
+        fclose(c->fp);
+        exit(1);
+    }
+    if (fclose(c->fp) != 0) {
+        fprintf(stderr, "gitpp: canonical form close failed (%s)\n", strerror(errno));
+        free(c->buf);
+        exit(1);
+    }
+    return c->buf;
+}
+
+// Canonical serialisation of `v` as a malloc'd NUL-terminated string.
+// *out_len receives the exact length (the buffer's NUL is not counted).
+static char *canon_of(json_value_t *v, size_t *out_len) {
+    canon_t c;
+    canon_begin(&c);
+    emit_value(c.fp, v);
+    char *buf = canon_end(&c);
+    if (out_len) *out_len = c.len;
+    return buf;
+}
+
 // ========== Record representation ==========
 
 typedef struct {
@@ -678,33 +750,34 @@ static void record_leaf(record_t *r, char out_hex[65]) {
     member_values[3] = &parents_arr;
     member_values[4] = &reason_val;
 
-    // Emitted into a fixed buffer. NOTE: this truncates silently past 8 KiB --
-    // a record whose canonical form is larger than that is hashed truncated.
-    // Unfixed here (the pinned cases are small); see README gotcha 7.
-    char buf[8192];
-    size_t pos = 0;
-    memset(buf, 0, sizeof(buf));
-    FILE *mem = fmemopen(buf, sizeof(buf), "w");
-    fputc('{', mem);
+    // Emitted into a GROWABLE canonical sink (see "Canonical-form sink"
+    // above). This used to be `char buf[8192]` + fmemopen(), which silently
+    // hashed the first 8191 bytes of any record whose canonical form was
+    // larger -- so a record with a long string in `effects` aliased every other
+    // record that shared its first 8191 canonical bytes. open_memstream
+    // reallocates as it writes, so there is no length at which the leaf can
+    // come from a prefix of the record.
+    canon_t c;
+    canon_begin(&c);
+    fputc('{', c.fp);
     for (int i = 0; i < 5; i++) {
-        if (i > 0) fputs(", ", mem);
+        if (i > 0) fputs(", ", c.fp);
         // emit key
-        emit_string(mem, member_keys[i]);
-        fputs(": ", mem);
+        emit_string(c.fp, member_keys[i]);
+        fputs(": ", c.fp);
         // emit value
-        emit_value(mem, member_values[i]);
+        emit_value(c.fp, member_values[i]);
     }
-    fputc('}', mem);
-    fclose(mem);
-    
-    // Get the length actually written
-    pos = strlen(buf);
-    
-    // Hash
+    fputc('}', c.fp);
+    char *canon = canon_end(&c);
+
+    // Hash the WHOLE canonical form. c.len is the length open_memstream
+    // recorded, not a strlen() over a buffer that might have been cut short.
     uint8_t hash[32];
-    sha256((unsigned char *)buf, pos, hash);
+    sha256((const unsigned char *)canon, c.len, hash);
     for (int i = 0; i < 32; i++) sprintf(out_hex + i*2, "%02x", hash[i]);
     out_hex[64] = '\0';
+    free(canon);
     
     if (sorted_parents) free(sorted_parents);
     if (parent_items) {
@@ -794,14 +867,18 @@ static int is_descendant(const unsigned char *applied, const char *anc, const ch
 static int values_equal(json_value_t *a, json_value_t *b) {
     if (!a || !b) return a == b;
     if (a->type != b->type) return 0;
-    char ba[4096], bb[4096];
-    FILE *fa = fmemopen(ba, sizeof(ba), "w");
-    FILE *fb = fmemopen(bb, sizeof(bb), "w");
-    if (!fa || !fb) { if (fa) fclose(fa); if (fb) fclose(fb); return a == b; }
-    emit_value(fa, a);
-    emit_value(fb, b);
-    fclose(fa); fclose(fb);
-    return strcmp(ba, bb) == 0;
+    // Same growable sink as record_leaf(). This was `char ba[4096], bb[4096]`,
+    // and it was the more dangerous of the two: a >4095-byte canonical form
+    // truncated, so two DIFFERENT values with a long shared prefix compared
+    // EQUAL. §5.3 then found "no genuine disagreement" and dropped a real
+    // conflict out of the fold -- the ledger lost an entry, not just a hash.
+    size_t la = 0, lb = 0;
+    char *ba = canon_of(a, &la);
+    char *bb = canon_of(b, &lb);
+    int eq = (la == lb) && (memcmp(ba, bb, la) == 0);
+    free(ba);
+    free(bb);
+    return eq;
 }
 
 typedef struct {
