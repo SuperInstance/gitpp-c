@@ -1,0 +1,34 @@
+{
+ "conflicts": [
+  {
+   "key": "config.timeout",
+   "losers": [
+    "task-a",
+    "task-b",
+    "task-d"
+   ],
+   "winner": "override-1"
+  }
+ ],
+ "order": [
+  "genesis",
+  "task-a",
+  "task-b",
+  "override-1",
+  "task-c",
+  "task-d",
+  "witness-1",
+  "witness-2"
+ ],
+ "orphans": [],
+ "state": {
+  "config.timeout": 45,
+  "env.oracle_disk_pct": 93,
+  "env.oracle_load1_x100": 17,
+  "feature.cache": "on",
+  "feature.inherited": true,
+  "feature.search": "on",
+  "project": "poc-quilt-1",
+  "status": "open"
+ }
+}
