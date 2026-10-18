@@ -33,6 +33,29 @@ out=$("$GITPP" "$DIR/fixtures/poc-quilt-1.json" --at task-c)
 check "closure root at poc-quilt-1@task-c (the documented pass criterion)" \
       '{"closureRoot":"60effe23970d8a5cc837636c44685502361288c1f00577e9addfa10cbd4fc91d"}' "$out"
 
+# --- SPEC §4: an incomplete closure has a NULL root --------------------
+# The port used to skip a missing parent silently, so the closure looked
+# complete and it returned a HASH where every other port returns null.
+cat > "$TMP/incomplete.json" <<'JSON'
+[{"id":"task-1","kind":"task","parents":["missing-parent"],"effects":{"x":1}},
+ {"id":"task-2","kind":"task","parents":["task-1"],"effects":{"y":2}}]
+JSON
+out=$("$GITPP" "$TMP/incomplete.json" --at task-2)
+check "an incomplete closure has a NULL root (spec §4)" \
+      '{"closureRoot":null}' "$out"
+
+# The control: a complete closure still gets a real root, not null.
+cat > "$TMP/complete.json" <<'JSON'
+[{"id":"a","kind":"task","parents":[],"effects":{"x":1}},
+ {"id":"b","kind":"task","parents":["a"],"effects":{"y":2}}]
+JSON
+out=$("$GITPP" "$TMP/complete.json" --at b)
+if echo "$out" | grep -Eq '^\{"closureRoot":"[a-f0-9]{64}"\}$'; then
+  echo "  ok   a complete closure still has a 64-char root"; pass=$((pass + 1))
+else
+  echo "  FAIL a complete closure still has a 64-char root"; echo "         got $out"; fail=$((fail + 1))
+fi
+
 # --- derive() against the hub's golden ---------------------------------
 "$GITPP" "$DIR/fixtures/poc-quilt-1.json" --derive > "$TMP/derived.json"
 for member in state order orphans; do

@@ -1262,7 +1262,11 @@ int main(int argc, char **argv) {
         memset(closure_ids, 0, sizeof(closure_ids));
         size_t closure_count;
         closure_root(at, hex, closure_ids, &closure_count);
-        printf("{\"closureRoot\":\"%s\"}\n", hex);
+        /* An empty hex means there is no root: either `at` was not in the
+         * set, or the closure is incomplete (spec §4 -> null). Printing an
+         * empty string would be a root that is neither a hash nor null. */
+        if (hex[0] == '\0') printf("{\"closureRoot\":null}\n");
+        else printf("{\"closureRoot\":\"%s\"}\n", hex);
     } else {
         printf("{\"error\":\"no --at\"}\n");
     }
@@ -1301,9 +1305,24 @@ void closure_root(const char *at, char out_hex[65], char closure_ids[][256], siz
         }
     }
     
+    /* --- SPEC §4: an incomplete closure has a NULL root ---
+     *
+     * "If any ancestor of `at` is missing from the set, the closure is
+     * incomplete and the root is `null`."
+     *
+     * The walk below visits every ancestor of `at`. A parent id that is
+     * NOT in the record set is an ancestor of `at` that is missing, so the
+     * closure is incomplete.
+     *
+     * Previously the lookup simply found nothing and fell through: the
+     * missing parent was skipped silently, the closure looked complete,
+     * and a root was computed over the surviving records. Every other
+     * port returns null here; this one returned a hash. */
+    bool incomplete = false;
     while (sp > 0) {
         size_t cur = idx_stack[--sp];
         for (size_t i = 0; i < records[cur].parent_count; i++) {
+            bool found = false;
             for (size_t j = 0; j < record_count; j++) {
                 if (records[j].id && strcmp(records[j].id, records[cur].parents[i]) == 0) {
                     if (!in_closure[j]) {
@@ -1311,10 +1330,20 @@ void closure_root(const char *at, char out_hex[65], char closure_ids[][256], siz
                         closure_set[closure_set_count++] = records[j].id;
                         idx_stack[sp++] = j;
                     }
+                    found = true;
                     break;
                 }
             }
+            if (!found) incomplete = true;
         }
+    }
+    if (incomplete) {
+        out_hex[0] = '\0';
+        *closure_count = 0;
+        free(closure_set);
+        free(in_closure);
+        free(idx_stack);
+        return;
     }
     
     qsort(closure_set, closure_set_count, sizeof(char*), cmp_str_ptr);
